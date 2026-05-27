@@ -1,0 +1,29 @@
+# Build outputs
+bin/
+dist/
+
+# Go test/build artifacts
+*.test
+*.prof
+*.out
+coverage.txt
+coverage.html
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary archives produced while testing locally
+*.zip
+*.tar
+*.tar.gz
+*.tgz
