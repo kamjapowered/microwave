@@ -28,20 +28,11 @@ this builds and installs `microwave` into `~/.local/bin/microwave`.
 
 ## tagging
 
-re-export is opt-in. nothing leaves your package unless it carries a tag:
+re-export is opt-in. nothing leaves your package unless it carries a tag. place `//microwave:export` immediately above the declaration:
 
 ```go
 //microwave:export
 // Foo does the thing.
-type Foo struct{ Name string }
-```
-
-`gofmt` recognises `//microwave:export` as a directive and moves it to the bottom of the doc comment, beneath any human-readable lines. both positions work:
-
-```go
-// Foo does the thing.
-//
-//microwave:export
 type Foo struct{ Name string }
 ```
 
@@ -54,9 +45,7 @@ type Foo struct{}
 
 tags apply to individual declarations. for `var ( … )`, `const ( … )`, and `type ( … )` blocks, tag the spec inside the block, not the keyword.
 
-## output
-
-each tagged declaration becomes one entry in the umbrella file:
+## what gets emitted
 
 | source decl                       | umbrella emission                                        |
 | --------------------------------- | -------------------------------------------------------- |
@@ -65,8 +54,6 @@ each tagged declaration becomes one entry in the umbrella file:
 | exported const                    | `const Foo = pkg.Foo`                                    |
 | exported func (incl. generic)     | wrapper func that forwards to `pkg.Foo`                  |
 | methods on a re-exported type     | ride along with the type alias — no separate tag needed  |
-
-the generated file is deterministic: re-running on the same input produces byte-identical output, so it diffs cleanly in vcs.
 
 ## a taste
 
@@ -126,12 +113,11 @@ func Hello(name string) string { return a.Hello(name) }
 
 drop the invocation into a `//go:generate` line and `go generate ./...` regenerates the umbrella whenever your tags change.
 
-## design notes
+## good to know
 
-- nothing is exported unless explicitly tagged.
-- the umbrella imports each source package once; aliases are derived deterministically from the import path.
-- function signatures are rewritten so that types you have also tagged appear under their umbrella names — the consumer sees one consistent surface, not a mix of `pkg.X` and umbrella names.
-- declarations that would not compile in the umbrella (unexported source names, unexported types in a func signature, generic types on `go.mod < 1.24`) are rejected before any file is written.
-- soft issues that are still emittable (leaked unexported types via struct fields or var/const declared types, unreachable generic constraints) are reported as warnings and the file is still written.
+- nothing is exported unless you tag it.
+- re-running on the same input produces byte-identical output, so the umbrella diffs cleanly in vcs.
+- when a tagged func takes a parameter whose type you have also tagged, the wrapper uses your umbrella name — consumers see one consistent surface.
+- if a tag would produce a file that can't compile (unexported source names, unexported types leaking into a func signature, etc.), microwave refuses to write the file and tells you which tag is at fault.
 
 run `microwave --help` for the full flag list.
