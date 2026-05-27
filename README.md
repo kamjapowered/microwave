@@ -28,17 +28,22 @@ this builds and installs `microwave` into `~/.local/bin/microwave`.
 
 ## tagging
 
-re-export is opt-in. nothing leaves your package unless it carries a tag. place `//microwave:export` immediately above the declaration:
+re-export is opt-in. nothing leaves your package unless it carries a tag. write `//microwave:export` as the last line of the declaration's doc comment, separated from the prose by a blank `//`:
 
 ```go
-//microwave:export
 // Foo does the thing.
+//
+//microwave:export
 type Foo struct{ Name string }
 ```
+
+this is the form `gofmt` produces (it treats `//microwave:export` as a directive and parks it just above the decl), so it survives saves and re-runs.
 
 a second token after `export` overrides the name in the umbrella — useful for resolving collisions when two packages each export a `Foo`:
 
 ```go
+// Foo is renamed to Bar in the umbrella.
+//
 //microwave:export Bar
 type Foo struct{}
 ```
@@ -63,12 +68,14 @@ input:
 // api/a/a.go
 package a
 
-//microwave:export
 // Foo does the thing.
+//
+//microwave:export
 type Foo struct{ Name string }
 
-//microwave:export
 // Hello says hi.
+//
+//microwave:export
 func Hello(name string) string { return "hi " + name }
 ```
 
@@ -76,8 +83,9 @@ func Hello(name string) string { return "hi " + name }
 // api/b/b.go
 package b
 
-//microwave:export
 // Baz is a constant.
+//
+//microwave:export
 const Baz = "baz"
 ```
 
