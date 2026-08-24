@@ -70,14 +70,29 @@ func (s Severity) String() string {
 	return "?"
 }
 
+// Field is one key/value bullet that appears in the body of a
+// Diagnostic. Keys are right-aligned by the UI so multiple fields line
+// up beneath the header.
+type Field struct {
+	Key   string
+	Value string
+}
+
+// F is a tiny constructor for Field; cuts down the noise at emission
+// sites.
+func F(key, value string) Field { return Field{Key: key, Value: value} }
+
 // Diagnostic is a single user-facing message produced by any pipeline
 // phase. Rule is a short stable id so callers and tests can match on
-// it without parsing Message.
+// it without parsing Summary. Summary is a one-line human-readable
+// description; Fields decompose the specifics into key/value bullets.
+// The Pos is rendered as an implicit final "at:" field.
 type Diagnostic struct {
 	Severity Severity
 	Pos      token.Position
 	Rule     string
-	Message  string
+	Summary  string
+	Fields   []Field
 }
 
 // HasErrors reports whether any diagnostic in d carries SevError.
@@ -113,7 +128,7 @@ const (
 
 	// Warnings.
 	RuleUnexpFieldType  = "unexported-field-type" // §5.2
-	RuleUnexpValueType  = "unexported-value-type" // §5.2
 	RuleUnexpConstraint = "unexported-constraint" // §5.2
 	RuleFloatingTag     = "floating-tag"          // §3: tag not contiguous with a decl
+	RuleExcludeNoMatch  = "exclude-no-match"      // --exclude pattern matched no packages
 )

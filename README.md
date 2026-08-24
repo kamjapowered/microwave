@@ -8,6 +8,18 @@
   <strong>opt-in umbrella packages for go modules</strong>
 </p>
 
+<div align="center">
+
+<br>
+
+[![go version][go_version_img]][go_dev_url]
+[![version][repo_version_img]][repo_version_url]
+[![license][repo_license_img]][repo_license_url]
+
+<br>
+
+</div>
+
 ---
 
 `microwave` is a small go cli that scans tagged declarations across one or more packages and emits a single umbrella `.go` file that re-exports them:
@@ -21,10 +33,14 @@ the goal is to give downstream consumers one import path that covers the ~90% of
 ## install
 
 ```sh
-just install
+go install kamjapowered.com/microwave@latest
 ```
 
-this builds and installs `microwave` into `~/.local/bin/microwave`.
+the import path is `kamjapowered.com/microwave`, not the github url. the
+repository is the source; the module path is the domain.
+
+to build from a clone instead, `just install` puts the binary in
+`~/.local/bin/microwave`.
 
 ## tagging
 
@@ -95,6 +111,12 @@ invocation:
 microwave ./api/... --out umbrella.go --pkg umbrella
 ```
 
+if some packages under your scan path import the umbrella themselves (a consumer that depends on `umbrella.Foo` and lives in the same module), pass `--exclude` to keep them out of the scan — they'd otherwise fail to load while the umbrella is being regenerated:
+
+```sh
+microwave ./pkg/... --exclude ./pkg/consumer --out umbrella/umbrella.go --pkg umbrella
+```
+
 output:
 
 ```go
@@ -105,18 +127,26 @@ output:
 package umbrella
 
 import (
-	a "example.com/mod/api/a"
-	b "example.com/mod/api/b"
+	"example.com/mod/api/a"
+	"example.com/mod/api/b"
 )
+
+// =
+// a
+// =
 
 // Foo does the thing.
 type Foo = a.Foo
 
-// Baz is a constant.
-const Baz = b.Baz
-
 // Hello says hi.
 func Hello(name string) string { return a.Hello(name) }
+
+// =
+// b
+// =
+
+// Baz is a constant.
+const Baz = b.Baz
 ```
 
 drop the invocation into a `//go:generate` line and `go generate ./...` regenerates the umbrella whenever your tags change.
@@ -129,3 +159,18 @@ drop the invocation into a `//go:generate` line and `go generate ./...` regenera
 - if a tag would produce a file that can't compile (unexported source names, unexported types leaking into a func signature, etc.), microwave refuses to write the file and tells you which tag is at fault.
 
 run `microwave --help` for the full flag list.
+
+## licence
+
+the code is [mit](./LICENSE).
+
+**the content is carved out.** the name, the logo and the wordmark are all
+rights reserved. the mit grant covers the code in this repository and not the
+marks it is published under.
+
+[go_version_img]: https://img.shields.io/badge/go-1.27+-00add8?style=for-the-badge&logo=go
+[go_dev_url]: https://go.dev/
+[repo_license_img]: https://img.shields.io/github/license/kamjapowered/microwave?style=for-the-badge
+[repo_license_url]: https://github.com/kamjapowered/microwave/blob/main/LICENSE
+[repo_version_img]: https://img.shields.io/github/v/tag/kamjapowered/microwave?style=for-the-badge
+[repo_version_url]: https://github.com/kamjapowered/microwave/tags

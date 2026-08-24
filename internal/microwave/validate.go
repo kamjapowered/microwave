@@ -24,10 +24,13 @@ func validate(decls []TaggedDecl, modGo string) (map[string]string, []Diagnostic
 				Severity: SevError,
 				Pos:      d.Pos,
 				Rule:     RuleCollision,
-				Message: fmt.Sprintf(
-					"emit name %q collides with %s.%s at %s; resolve via a rename token",
-					d.EmitName, first.SourcePkg, first.SourceName, first.Pos,
-				),
+				Summary:  "two tagged decls share an umbrella name",
+				Fields: []Field{
+					F("emit name", d.EmitName),
+					F("first", first.SourcePkg+"."+first.SourceName),
+					F("first at", first.Pos.String()),
+					F("fix", "rename one via the tag's rename token"),
+				},
 			})
 			continue
 		}
@@ -63,10 +66,11 @@ func validateDecl(d TaggedDecl, modGo string) []Diagnostic {
 			Severity: SevError,
 			Pos:      d.Pos,
 			Rule:     RuleUnexportedDecl,
-			Message: fmt.Sprintf(
-				"cannot re-export unexported %s %s.%s; Go's visibility rules make the source identifier unreachable",
-				d.Kind, d.SourcePkg, d.SourceName,
-			),
+			Summary:  "tagged decl is unexported",
+			Fields: []Field{
+				F("kind", d.Kind.String()),
+				F("name", d.SourcePkg+"."+d.SourceName),
+			},
 		})
 	}
 	if d.EmitName != d.SourceName && !isExportedIdent(d.EmitName) {
@@ -74,18 +78,14 @@ func validateDecl(d TaggedDecl, modGo string) []Diagnostic {
 			Severity: SevError,
 			Pos:      d.Pos,
 			Rule:     RuleLowercaseRen,
-			Message: fmt.Sprintf(
-				"rename token %q starts with a lowercase letter; the umbrella name must be exported",
-				d.EmitName,
-			),
+			Summary:  "rename token must start with an uppercase letter",
+			Fields:   []Field{F("got", d.EmitName)},
 		})
 	}
 
 	switch d.Kind {
 	case KindType:
 		diags = append(diags, validateType(d, modGo)...)
-	case KindVar, KindConst:
-		diags = append(diags, validateValue(d)...)
 	case KindFunc:
 		diags = append(diags, validateFunc(d)...)
 	}
@@ -109,10 +109,11 @@ func validateType(d TaggedDecl, modGo string) []Diagnostic {
 			Severity: SevError,
 			Pos:      d.Pos,
 			Rule:     RuleGenericPre124,
-			Message: fmt.Sprintf(
-				"generic type %s.%s requires module Go directive >= 1.24 (got %s) for generic type aliases",
-				d.SourcePkg, d.SourceName, modGo,
-			),
+			Summary:  "generic type alias requires Go 1.24+",
+			Fields: []Field{
+				F("type", d.SourcePkg+"."+d.SourceName),
+				F("go.mod", modGo),
+			},
 		})
 	}
 
@@ -126,10 +127,11 @@ func validateType(d TaggedDecl, modGo string) []Diagnostic {
 						Severity: SevWarning,
 						Pos:      d.Pos,
 						Rule:     RuleUnexpConstraint,
-						Message: fmt.Sprintf(
-							"generic constraint of %s.%s references unexported type %s",
-							d.SourcePkg, d.SourceName, refQualified(ref),
-						),
+						Summary:  "generic constraint references an unexported type",
+						Fields: []Field{
+							F("type", d.SourcePkg+"."+d.SourceName),
+							F("references", refQualified(ref)),
+						},
 					})
 				}
 			}
@@ -148,36 +150,17 @@ func validateType(d TaggedDecl, modGo string) []Diagnostic {
 					Severity: SevWarning,
 					Pos:      d.Pos,
 					Rule:     RuleUnexpFieldType,
-					Message: fmt.Sprintf(
-						"exported field %s of %s.%s references unexported type %s",
-						f.Name(), d.SourcePkg, d.SourceName, refQualified(ref),
-					),
+					Summary:  "exported struct field has an unexported type",
+					Fields: []Field{
+						F("type", d.SourcePkg+"."+d.SourceName),
+						F("field", f.Name()),
+						F("field type", refQualified(ref)),
+					},
 				})
 			}
 		}
 	}
 
-	return diags
-}
-
-func validateValue(d TaggedDecl) []Diagnostic {
-	var diags []Diagnostic
-
-	v, ok := d.Obj.(interface{ Type() types.Type })
-	if !ok {
-		return diags
-	}
-	for _, ref := range findUnexportedRefs(v.Type(), nil) {
-		diags = append(diags, Diagnostic{
-			Severity: SevWarning,
-			Pos:      d.Pos,
-			Rule:     RuleUnexpValueType,
-			Message: fmt.Sprintf(
-				"%s %s.%s has unexported type %s in its declared type",
-				d.Kind, d.SourcePkg, d.SourceName, refQualified(ref),
-			),
-		})
-	}
 	return diags
 }
 
@@ -201,10 +184,11 @@ func validateFunc(d TaggedDecl) []Diagnostic {
 				Severity: SevError,
 				Pos:      d.Pos,
 				Rule:     RuleUnexportedSig,
-				Message: fmt.Sprintf(
-					"signature of func %s.%s mentions unexported type %s; wrapper would not compile",
-					d.SourcePkg, d.SourceName, refQualified(ref),
-				),
+				Summary:  "signature uses an unexported type",
+				Fields: []Field{
+					F("func", d.SourcePkg+"."+d.SourceName),
+					F("type", refQualified(ref)),
+				},
 			})
 		}
 	}
@@ -261,6 +245,14 @@ func walkType(t types.Type, seen map[*types.TypeName]bool, out *[]*types.TypeNam
 			walkType(x.TypeArgs().At(i), seen, out)
 		}
 	case *types.Alias:
+		// An alias is exposed to consumers under its own name. If the
+		// alias name is exported, the wrapper can spell it out and
+		// compile — the underlying type stays hidden behind the alias.
+		// We deliberately do NOT recurse into types.Unalias here:
+		// doing so would flag the underlying type even when the user
+		// has explicitly aliased it under an exported name (e.g.
+		// `type Entity = entity`), which is exactly the use case
+		// aliases exist for.
 		tn := x.Obj()
 		if seen[tn] {
 			return
@@ -269,7 +261,6 @@ func walkType(t types.Type, seen map[*types.TypeName]bool, out *[]*types.TypeNam
 		if tn.Pkg() != nil && !tn.Exported() {
 			*out = append(*out, tn)
 		}
-		walkType(types.Unalias(x), seen, out)
 	case *types.Pointer:
 		walkType(x.Elem(), seen, out)
 	case *types.Slice:

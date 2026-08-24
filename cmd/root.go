@@ -7,15 +7,16 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"microwave/internal/microwave"
+	"kamjapowered.com/microwave/internal/microwave"
 )
 
-const Version = "0.0.1"
+const Version = "0.1.0"
 
 var (
-	outPath string
-	pkgName string
-	version bool
+	outPath  string
+	pkgName  string
+	excludes []string
+	version  bool
 )
 
 var rootCmd = &cobra.Command{
@@ -41,11 +42,12 @@ var rootCmd = &cobra.Command{
 		}
 
 		return microwave.Run(microwave.Config{
-			Paths:  args,
-			Out:    outPath,
-			Pkg:    pkgName,
-			Args:   os.Args[1:],
-			Stderr: os.Stderr,
+			Paths:    args,
+			Excludes: excludes,
+			Out:      outPath,
+			Pkg:      pkgName,
+			Args:     os.Args[1:],
+			Stderr:   os.Stderr,
 		})
 	},
 }
@@ -69,6 +71,12 @@ func init() {
 		"",
 		"package name declared at the top of the generated file (required)",
 	)
+	rootCmd.Flags().StringSliceVar(
+		&excludes,
+		"exclude",
+		nil,
+		"package path(s) to skip; may be repeated. Accepts the same patterns as positional paths (e.g. ./pkg/consumer or ./pkg/consumer/...)",
+	)
 	rootCmd.Flags().BoolVarP(
 		&version,
 		"version",
@@ -87,14 +95,14 @@ func Execute() {
 	var ue *usageErr
 	switch {
 	case errors.As(err, &ue):
-		fmt.Fprintln(os.Stderr, "microwave: "+ue.Error())
+		microwave.PrintError(os.Stderr, ue.Error())
 		os.Exit(2)
 	case errors.Is(err, microwave.ErrUsage):
 		os.Exit(2)
 	case errors.Is(err, microwave.ErrPipeline):
 		os.Exit(1)
 	default:
-		fmt.Fprintln(os.Stderr, "microwave: "+err.Error())
+		microwave.PrintError(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }

@@ -17,27 +17,13 @@ import (
 // emit produces the formatted umbrella source bytes from the validated
 // decl set. It also writes the result to cfg.Out on success.
 func emit(cfg Config, decls []TaggedDecl, lookup map[string]string) ([]Diagnostic, error) {
-	pkgPaths := collectPackages(decls)
-	aliases := assignAliases(pkgPaths)
+	natural := collectPackages(decls)
+	chosen := assignAliases(natural)
 
 	var buf strings.Builder
 	renderHeader(&buf, cfg)
-	renderImports(&buf, aliases)
-
-	byKind := groupDecls(decls)
-
-	for _, d := range byKind[KindType] {
-		renderType(&buf, d, aliases, lookup)
-	}
-	for _, d := range byKind[KindVar] {
-		renderVar(&buf, d, aliases, lookup)
-	}
-	for _, d := range byKind[KindConst] {
-		renderConst(&buf, d, aliases, lookup)
-	}
-	for _, d := range byKind[KindFunc] {
-		renderFunc(&buf, d, aliases, lookup)
-	}
+	renderImports(&buf, natural, chosen)
+	renderBody(&buf, decls, natural, chosen, lookup)
 
 	out, err := format.Source([]byte(buf.String()))
 	if err != nil {
@@ -45,7 +31,8 @@ func emit(cfg Config, decls []TaggedDecl, lookup map[string]string) ([]Diagnosti
 			Severity: SevError,
 			Rule:     RuleEmitFormat,
 			Pos:      token.Position{Filename: cfg.Out},
-			Message:  fmt.Sprintf("internal: gofmt failed on emitted output: %v", err),
+			Summary:  "gofmt failed on emitted output (internal bug)",
+			Fields:   []Field{F("error", err.Error())},
 		}}, nil
 	}
 
@@ -55,30 +42,39 @@ func emit(cfg Config, decls []TaggedDecl, lookup map[string]string) ([]Diagnosti
 	return nil, nil
 }
 
-// collectPackages walks every decl's AST and collects every package
-// path that the emitted umbrella will need to import.
-func collectPackages(decls []TaggedDecl) map[string]bool {
-	set := map[string]bool{}
+// collectPackages walks every decl's AST and returns the set of source
+// packages that the umbrella file needs to reference. The map values
+// are the packages' declared names (the identifier in their `package`
+// clause); if not resolvable, an empty string is stored and resolved
+// to the path's last segment by assignAliases.
+func collectPackages(decls []TaggedDecl) map[string]string {
+	out := map[string]string{}
+	addPkg := func(path, name string) {
+		if cur, ok := out[path]; !ok || cur == "" {
+			out[path] = name
+		}
+	}
+
 	for _, d := range decls {
-		set[d.SourcePkg] = true
+		addPkg(d.SourcePkg, d.Pkg.Name)
 		switch d.Kind {
 		case KindFunc:
 			fd := d.Decl.(*ast.FuncDecl)
-			walkExprPkgs(fd.Type, d.Pkg, set)
+			walkExprPkgs(fd.Type, d.Pkg, addPkg)
 		case KindType:
 			ts := d.Decl.(*ast.TypeSpec)
 			if ts.TypeParams != nil {
-				walkExprPkgs(ts.TypeParams, d.Pkg, set)
+				walkExprPkgs(ts.TypeParams, d.Pkg, addPkg)
 			}
 		}
 	}
-	return set
+	return out
 }
 
-// walkExprPkgs visits every Ident/SelectorExpr in node and adds the
-// resolved package paths to set. Builtins and type parameters are
-// skipped.
-func walkExprPkgs(node ast.Node, pkg *packages.Package, set map[string]bool) {
+// walkExprPkgs visits every Ident/SelectorExpr in node and reports the
+// resolved package path + declared package name to add. Builtins and
+// type parameters are skipped.
+func walkExprPkgs(node ast.Node, pkg *packages.Package, add func(path, name string)) {
 	if node == nil {
 		return
 	}
@@ -87,8 +83,9 @@ func walkExprPkgs(node ast.Node, pkg *packages.Package, set map[string]bool) {
 		case *ast.SelectorExpr:
 			if x, ok := e.X.(*ast.Ident); ok {
 				if pn, ok := pkg.TypesInfo.Uses[x].(*types.PkgName); ok {
-					set[pn.Imported().Path()] = true
-					return false // do not descend further into pkg.Sel
+					imp := pn.Imported()
+					add(imp.Path(), imp.Name())
+					return false
 				}
 			}
 		case *ast.Ident:
@@ -102,36 +99,40 @@ func walkExprPkgs(node ast.Node, pkg *packages.Package, set map[string]bool) {
 				}
 			}
 			if obj.Pkg() != nil {
-				set[obj.Pkg().Path()] = true
+				add(obj.Pkg().Path(), obj.Pkg().Name())
 			}
 		}
 		return true
 	})
 }
 
-// assignAliases produces a deterministic importPath -> alias map.
-// Alias is the last path segment, lowercased; collisions are resolved
-// by appending a numeric suffix in sorted-path order.
-func assignAliases(pkgs map[string]bool) map[string]string {
-	paths := make([]string, 0, len(pkgs))
-	for p := range pkgs {
+// assignAliases produces a deterministic importPath -> identifier map.
+// The identifier equals the package's declared name when that name is
+// unique across the set; collisions are resolved by appending a
+// numeric suffix in sorted-path order.
+func assignAliases(natural map[string]string) map[string]string {
+	paths := make([]string, 0, len(natural))
+	for p := range natural {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
 
-	out := make(map[string]string, len(paths))
-	used := map[string]int{}
+	chosen := make(map[string]string, len(paths))
+	count := map[string]int{}
 	for _, p := range paths {
-		base := strings.ToLower(lastSegment(p))
-		base = sanitizeAlias(base)
-		alias := base
-		used[base]++
-		if used[base] > 1 {
-			alias = fmt.Sprintf("%s%d", base, used[base])
+		base := natural[p]
+		if base == "" {
+			base = lastSegment(p)
 		}
-		out[p] = alias
+		base = sanitizeAlias(base)
+		count[base]++
+		if count[base] == 1 {
+			chosen[p] = base
+		} else {
+			chosen[p] = fmt.Sprintf("%s%d", base, count[base])
+		}
 	}
-	return out
+	return chosen
 }
 
 func lastSegment(p string) string {
@@ -175,35 +176,89 @@ func renderHeader(buf *strings.Builder, cfg Config) {
 	buf.WriteString("\n\n")
 }
 
-func renderImports(buf *strings.Builder, aliases map[string]string) {
-	if len(aliases) == 0 {
+// renderImports writes the import block. A bare `"path"` is used when
+// the chosen identifier matches the package's declared name; otherwise
+// an explicit `alias "path"` is emitted.
+func renderImports(buf *strings.Builder, natural, chosen map[string]string) {
+	if len(chosen) == 0 {
 		return
 	}
-	paths := make([]string, 0, len(aliases))
-	for p := range aliases {
+	paths := make([]string, 0, len(chosen))
+	for p := range chosen {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
 	buf.WriteString("import (\n")
 	for _, p := range paths {
-		fmt.Fprintf(buf, "\t%s %q\n", aliases[p], p)
+		if chosen[p] == natural[p] && natural[p] != "" {
+			fmt.Fprintf(buf, "\t%q\n", p)
+		} else {
+			fmt.Fprintf(buf, "\t%s %q\n", chosen[p], p)
+		}
 	}
 	buf.WriteString(")\n\n")
 }
 
-// groupDecls splits decls by Kind, sorting each group by EmitName for
-// deterministic output.
-func groupDecls(decls []TaggedDecl) map[Kind][]TaggedDecl {
-	g := map[Kind][]TaggedDecl{}
+// renderBody emits one section per source package, sorted by the
+// chosen identifier (case-insensitive). Within each section, all
+// tagged decls are sorted by emit name (case-insensitive) regardless
+// of kind. Each section begins with an `// === pkg ===` banner.
+func renderBody(buf *strings.Builder, decls []TaggedDecl, natural, chosen, lookup map[string]string) {
+	byPkg := map[string][]TaggedDecl{}
 	for _, d := range decls {
-		g[d.Kind] = append(g[d.Kind], d)
+		byPkg[d.SourcePkg] = append(byPkg[d.SourcePkg], d)
 	}
-	for k := range g {
-		sort.SliceStable(g[k], func(i, j int) bool {
-			return g[k][i].EmitName < g[k][j].EmitName
+
+	paths := make([]string, 0, len(byPkg))
+	for p := range byPkg {
+		paths = append(paths, p)
+	}
+	sort.SliceStable(paths, func(i, j int) bool {
+		ai := strings.ToLower(chosen[paths[i]])
+		aj := strings.ToLower(chosen[paths[j]])
+		if ai != aj {
+			return ai < aj
+		}
+		return paths[i] < paths[j]
+	})
+
+	for _, path := range paths {
+		group := byPkg[path]
+		sort.SliceStable(group, func(i, j int) bool {
+			ni := strings.ToLower(group[i].EmitName)
+			nj := strings.ToLower(group[j].EmitName)
+			if ni != nj {
+				return ni < nj
+			}
+			return group[i].EmitName < group[j].EmitName
 		})
+
+		writeBanner(buf, chosen[path])
+		for _, d := range group {
+			renderDecl(buf, d, natural, chosen, lookup)
+		}
 	}
-	return g
+}
+
+// writeBanner emits an xp.go-style banner: a `// ===` rule above and
+// below the package name, with the rule width matching the name.
+func writeBanner(buf *strings.Builder, name string) {
+	rule := strings.Repeat("=", len(name))
+	fmt.Fprintf(buf, "// %s\n// %s\n// %s\n\n", rule, name, rule)
+}
+
+func renderDecl(buf *strings.Builder, d TaggedDecl, natural, chosen, lookup map[string]string) {
+	switch d.Kind {
+	case KindType:
+		renderType(buf, d, chosen, lookup)
+	case KindVar:
+		renderVar(buf, d, chosen)
+	case KindConst:
+		renderConst(buf, d, chosen)
+	case KindFunc:
+		renderFunc(buf, d, chosen, lookup)
+	}
+	_ = natural
 }
 
 func writeDoc(buf *strings.Builder, doc string) {
@@ -216,54 +271,51 @@ func writeDoc(buf *strings.Builder, doc string) {
 	}
 }
 
-func renderType(buf *strings.Builder, d TaggedDecl, aliases, lookup map[string]string) {
+func renderType(buf *strings.Builder, d TaggedDecl, chosen, lookup map[string]string) {
 	ts := d.Decl.(*ast.TypeSpec)
-	alias := aliases[d.SourcePkg]
+	pkg := chosen[d.SourcePkg]
 
 	writeDoc(buf, d.DocComment)
 	buf.WriteString("type ")
 	buf.WriteString(d.EmitName)
 
 	if ts.TypeParams != nil && len(ts.TypeParams.List) > 0 {
-		r := newRewriter(d.Pkg, aliases, lookup)
+		r := newRewriter(d.Pkg, chosen, lookup)
 		buf.WriteString(r.renderTypeParams(ts.TypeParams))
 		buf.WriteString(" = ")
-		buf.WriteString(alias)
+		buf.WriteString(pkg)
 		buf.WriteString(".")
 		buf.WriteString(d.SourceName)
 		buf.WriteString(r.renderTypeParamArgs(ts.TypeParams))
 	} else {
 		buf.WriteString(" = ")
-		buf.WriteString(alias)
+		buf.WriteString(pkg)
 		buf.WriteString(".")
 		buf.WriteString(d.SourceName)
 	}
 	buf.WriteString("\n\n")
 }
 
-func renderVar(buf *strings.Builder, d TaggedDecl, aliases, lookup map[string]string) {
-	alias := aliases[d.SourcePkg]
+func renderVar(buf *strings.Builder, d TaggedDecl, chosen map[string]string) {
 	writeDoc(buf, d.DocComment)
-	fmt.Fprintf(buf, "var %s = %s.%s\n\n", d.EmitName, alias, d.SourceName)
-	_ = lookup
+	fmt.Fprintf(buf, "var %s = %s.%s\n\n", d.EmitName, chosen[d.SourcePkg], d.SourceName)
 }
 
-func renderConst(buf *strings.Builder, d TaggedDecl, aliases, lookup map[string]string) {
-	alias := aliases[d.SourcePkg]
+func renderConst(buf *strings.Builder, d TaggedDecl, chosen map[string]string) {
 	writeDoc(buf, d.DocComment)
-	fmt.Fprintf(buf, "const %s = %s.%s\n\n", d.EmitName, alias, d.SourceName)
-	_ = lookup
+	fmt.Fprintf(buf, "const %s = %s.%s\n\n", d.EmitName, chosen[d.SourcePkg], d.SourceName)
 }
 
-func renderFunc(buf *strings.Builder, d TaggedDecl, aliases, lookup map[string]string) {
+func renderFunc(buf *strings.Builder, d TaggedDecl, chosen, lookup map[string]string) {
 	fd := d.Decl.(*ast.FuncDecl)
-	alias := aliases[d.SourcePkg]
-	r := newRewriter(d.Pkg, aliases, lookup)
+	pkg := chosen[d.SourcePkg]
+	r := newRewriter(d.Pkg, chosen, lookup)
 
 	writeDoc(buf, d.DocComment)
 	buf.WriteString("func ")
 	buf.WriteString(d.EmitName)
-	if fd.Type.TypeParams != nil && len(fd.Type.TypeParams.List) > 0 {
+	hasTypeParams := fd.Type.TypeParams != nil && len(fd.Type.TypeParams.List) > 0
+	if hasTypeParams {
 		buf.WriteString(r.renderTypeParams(fd.Type.TypeParams))
 	}
 	params, callArgs, variadic := r.renderParams(fd.Type.Params)
@@ -279,10 +331,10 @@ func renderFunc(buf *strings.Builder, d TaggedDecl, aliases, lookup map[string]s
 	if hasResults {
 		buf.WriteString("return ")
 	}
-	buf.WriteString(alias)
+	buf.WriteString(pkg)
 	buf.WriteString(".")
 	buf.WriteString(d.SourceName)
-	if fd.Type.TypeParams != nil && len(fd.Type.TypeParams.List) > 0 {
+	if hasTypeParams && !typeArgsInferable(fd.Type) {
 		buf.WriteString(r.renderTypeParamArgs(fd.Type.TypeParams))
 	}
 	buf.WriteString("(")
@@ -291,6 +343,40 @@ func renderFunc(buf *strings.Builder, d TaggedDecl, aliases, lookup map[string]s
 		buf.WriteString("...")
 	}
 	buf.WriteString(") }\n\n")
+}
+
+// typeArgsInferable reports whether the source func's type parameters
+// can all be inferred at the call site from the argument types alone.
+// True iff every declared type-parameter name appears at least once
+// inside one of the function's parameter type expressions.
+//
+// When this holds, the wrapper body can call `pkg.F(args...)` and Go
+// will infer the type args. Otherwise the wrapper must spell them out
+// as `pkg.F[T1, T2, ...](args...)` — typically when a type param
+// appears only in the result type.
+func typeArgsInferable(ft *ast.FuncType) bool {
+	if ft.TypeParams == nil || len(ft.TypeParams.List) == 0 {
+		return true
+	}
+	declared := map[string]bool{}
+	for _, f := range ft.TypeParams.List {
+		for _, n := range f.Names {
+			declared[n.Name] = true
+		}
+	}
+	if ft.Params == nil {
+		return len(declared) == 0
+	}
+	seen := map[string]bool{}
+	for _, f := range ft.Params.List {
+		ast.Inspect(f.Type, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && declared[id.Name] {
+				seen[id.Name] = true
+			}
+			return true
+		})
+	}
+	return len(seen) == len(declared)
 }
 
 func writeOutput(out string, data []byte) error {
@@ -306,16 +392,16 @@ func writeOutput(out string, data []byte) error {
 // in two ways:
 //   - identifiers whose source-qualified name is in the lookup map are
 //     replaced with their umbrella emit name (no qualifier)
-//   - other named types are qualified with the import alias the
+//   - other named types are qualified with the chosen identifier the
 //     umbrella has assigned to their declaring package
 type rewriter struct {
-	pkg     *packages.Package
-	aliases map[string]string
-	lookup  map[string]string
+	pkg    *packages.Package
+	chosen map[string]string
+	lookup map[string]string
 }
 
-func newRewriter(pkg *packages.Package, aliases, lookup map[string]string) *rewriter {
-	return &rewriter{pkg: pkg, aliases: aliases, lookup: lookup}
+func newRewriter(pkg *packages.Package, chosen, lookup map[string]string) *rewriter {
+	return &rewriter{pkg: pkg, chosen: chosen, lookup: lookup}
 }
 
 func (r *rewriter) renderType(expr ast.Expr) string {
@@ -390,7 +476,7 @@ func (r *rewriter) renderIdent(e *ast.Ident) string {
 	if emit, ok := r.lookup[key]; ok {
 		return emit
 	}
-	alias, ok := r.aliases[obj.Pkg().Path()]
+	alias, ok := r.chosen[obj.Pkg().Path()]
 	if !ok {
 		return e.Name
 	}
@@ -405,7 +491,7 @@ func (r *rewriter) renderSelector(e *ast.SelectorExpr) string {
 			if emit, ok := r.lookup[key]; ok {
 				return emit
 			}
-			alias := r.aliases[path]
+			alias := r.chosen[path]
 			return alias + "." + e.Sel.Name
 		}
 	}
@@ -424,9 +510,6 @@ func (r *rewriter) renderFuncType(ft *ast.FuncType) string {
 	return b.String()
 }
 
-// renderFieldList formats a parenthesised field list. If withNames is
-// false, names are dropped (used for return signatures rendered as just
-// types).
 func (r *rewriter) renderFieldList(fl *ast.FieldList, withNames bool) string {
 	if fl == nil {
 		return "()"
@@ -449,8 +532,6 @@ func (r *rewriter) renderFieldList(fl *ast.FieldList, withNames bool) string {
 	return "(" + strings.Join(parts, ", ") + ")"
 }
 
-// renderResults returns the Go-source rendering of a result list. The
-// boolean reports whether the function has any results at all.
 func (r *rewriter) renderResults(fl *ast.FieldList) (string, bool) {
 	if fl == nil || len(fl.List) == 0 {
 		return "", false
@@ -461,9 +542,6 @@ func (r *rewriter) renderResults(fl *ast.FieldList) (string, bool) {
 	return r.renderFieldList(fl, false), true
 }
 
-// renderInterface emits an interface literal. For v0 we expect this
-// only in constraints (type sets); structural method sets in tagged
-// signatures are unusual but handled.
 func (r *rewriter) renderInterface(it *ast.InterfaceType) string {
 	if it.Methods == nil || len(it.Methods.List) == 0 {
 		return "interface{}"
@@ -509,8 +587,6 @@ func (r *rewriter) renderStruct(st *ast.StructType) string {
 	return "struct{ " + strings.Join(parts, "; ") + " }"
 }
 
-// renderTypeParams emits a complete type-parameter clause, e.g.
-// `[T any, U comparable]`. Constraints are rewritten via the rewriter.
 func (r *rewriter) renderTypeParams(fl *ast.FieldList) string {
 	parts := make([]string, 0, len(fl.List))
 	for _, f := range fl.List {
@@ -524,8 +600,6 @@ func (r *rewriter) renderTypeParams(fl *ast.FieldList) string {
 	return "[" + strings.Join(parts, ", ") + "]"
 }
 
-// renderTypeParamArgs emits the bracketed list of type parameter
-// identifiers used to instantiate the source type/func.
 func (r *rewriter) renderTypeParamArgs(fl *ast.FieldList) string {
 	names := make([]string, 0)
 	for _, f := range fl.List {
@@ -538,17 +612,16 @@ func (r *rewriter) renderTypeParamArgs(fl *ast.FieldList) string {
 
 // renderParams emits the wrapper's parameter list and a comma-separated
 // list of identifier names suitable for forwarding to the source func.
-// Blank/duplicate names — and names that would shadow an import alias
-// the wrapper's body relies on — are replaced with positional names
-// p0, p1, ... The trailing bool reports whether the last parameter is
-// variadic.
+// Blank/duplicate names — and names that would shadow a package
+// identifier the wrapper's body relies on — are replaced with
+// positional names p0, p1, ...
 func (r *rewriter) renderParams(fl *ast.FieldList) (params string, callArgs string, variadic bool) {
 	if fl == nil {
 		return "()", "", false
 	}
 
 	reserved := map[string]bool{}
-	for _, a := range r.aliases {
+	for _, a := range r.chosen {
 		reserved[a] = true
 	}
 
@@ -595,8 +668,6 @@ func (r *rewriter) renderParams(fl *ast.FieldList) (params string, callArgs stri
 	return "(" + strings.Join(parts, ", ") + ")", strings.Join(callParts, ", "), variadic
 }
 
-// max returns the larger of a, b. Kept local to avoid pulling in
-// generic stdlib helpers and so it inlines cleanly.
 func max(a, b int) int {
 	if a > b {
 		return a

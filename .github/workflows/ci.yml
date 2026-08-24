@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        # microwave is a cli people install on their own machine, so it is
+        # built and tested on both unix runners
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - uses: extractions/setup-just@v2
+
+      # fmt, vet, tidy, race and link. the recipe is the single source of
+      # truth, so ci and a local run cannot drift apart
+      - run: just ci

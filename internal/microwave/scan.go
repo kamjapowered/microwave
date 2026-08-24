@@ -3,10 +3,12 @@ package microwave
 import (
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -26,10 +28,22 @@ type scanResult struct {
 // Returns a non-nil error only for "cannot continue" conditions
 // (cwd/module discovery failure). Validation/load errors are surfaced
 // as diagnostics in the result.
-func scan(cfg Config, modRoot, modGo string) (scanResult, error) {
+func scan(cfg Config, modRoot, modGo, facadePath string) (scanResult, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return scanResult{}, fmt.Errorf("microwave: cannot determine cwd: %w", err)
+	}
+
+	resolved, rdiags, err := resolveScanSet(cwd, cfg.Paths, cfg.Excludes, facadePath)
+	if err != nil {
+		return scanResult{}, err
+	}
+
+	res := scanResult{ModRoot: modRoot, ModGo: modGo, Diags: rdiags}
+	if len(resolved) == 0 {
+		// Every scan path was excluded (or matched no packages). No
+		// type-check needed; downstream "no tags found" will fire.
+		return res, nil
 	}
 
 	pcfg := &packages.Config{
@@ -44,12 +58,10 @@ func scan(cfg Config, modRoot, modGo string) (scanResult, error) {
 		Fset: token.NewFileSet(),
 	}
 
-	pkgs, err := packages.Load(pcfg, cfg.Paths...)
+	pkgs, err := packages.Load(pcfg, resolved...)
 	if err != nil {
 		return scanResult{}, fmt.Errorf("microwave: packages.Load: %w", err)
 	}
-
-	res := scanResult{ModRoot: modRoot, ModGo: modGo}
 
 	// Fail fast on any per-package load errors.
 	for _, pkg := range pkgs {
@@ -58,7 +70,8 @@ func scan(cfg Config, modRoot, modGo string) (scanResult, error) {
 				Severity: SevError,
 				Pos:      loadErrPos(perr),
 				Rule:     RuleLoadError,
-				Message:  perr.Msg,
+				Summary:  "package load failed",
+				Fields:   []Field{F("error", perr.Msg)},
 			})
 		}
 	}
@@ -84,22 +97,136 @@ func scan(cfg Config, modRoot, modGo string) (scanResult, error) {
 	return res, nil
 }
 
+// resolveScanSet expands the user's positional scan paths and
+// --exclude patterns into a concrete list of package import paths to
+// type-check. It uses a fast metadata-only load (no types, no AST) so
+// the heavy compile pass only sees the producer packages.
+//
+// Excluded packages are subtracted by exact import path match after
+// expansion, so `--exclude ./pkg/consumer` and
+// `--exclude ./pkg/consumer/...` both work — but only if the named
+// path actually resolves to one or more packages. An exclude that
+// matches nothing (typically a parent directory with sub-packages but
+// no direct package, like `./backends`) emits an exclude-no-match
+// warning suggesting the recursive form.
+//
+// Packages that import facadePath — the umbrella package about to be
+// regenerated — are dropped automatically: a re-exporter can never
+// scan a package that consumes its own output (the build is circular,
+// and during regeneration the umbrella is removed, so they would not
+// type-check anyway). This means opt-in plugins built against the
+// umbrella self-exclude without an --exclude entry. facadePath is the
+// umbrella's own path, so the umbrella package never scans itself.
+func resolveScanSet(cwd string, paths, excludes []string, facadePath string) ([]string, []Diagnostic, error) {
+	if len(paths) == 0 {
+		return nil, nil, nil
+	}
+	pcfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles,
+		Dir:  cwd,
+	}
+
+	included, err := packages.Load(pcfg, paths...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("microwave: resolve scan paths: %w", err)
+	}
+
+	var diags []Diagnostic
+	excluded := map[string]bool{}
+	for _, e := range excludes {
+		exPkgs, err := packages.Load(pcfg, e)
+		if err != nil {
+			return nil, nil, fmt.Errorf("microwave: resolve --exclude %q: %w", e, err)
+		}
+		matched := false
+		for _, p := range exPkgs {
+			if p.PkgPath == "" {
+				continue
+			}
+			// Skip synthetic packages with no real source files (e.g.
+			// command-line-arguments returned when the pattern names a
+			// directory that has no direct Go files).
+			if len(p.GoFiles) == 0 {
+				continue
+			}
+			excluded[p.PkgPath] = true
+			matched = true
+		}
+		if !matched {
+			diags = append(diags, Diagnostic{
+				Severity: SevWarning,
+				Rule:     RuleExcludeNoMatch,
+				Summary:  "no packages matched --exclude",
+				Fields: []Field{
+					F("pattern", e),
+					F("hint", "for a directory of sub-packages use "+strings.TrimRight(e, "/")+"/..."),
+				},
+			})
+		}
+	}
+
+	seen := map[string]bool{}
+	out := make([]string, 0, len(included))
+	for _, p := range included {
+		if p.PkgPath == "" || seen[p.PkgPath] || excluded[p.PkgPath] {
+			continue
+		}
+		if p.PkgPath == facadePath || importsFacade(p.GoFiles, facadePath) {
+			continue
+		}
+		seen[p.PkgPath] = true
+		out = append(out, p.PkgPath)
+	}
+	return out, diags, nil
+}
+
+// importsFacade reports whether any of goFiles imports facadePath. It
+// parses imports only (no type-checking), so it is robust even while
+// the umbrella package is absent during regeneration.
+func importsFacade(goFiles []string, facadePath string) bool {
+	if facadePath == "" {
+		return false
+	}
+	fset := token.NewFileSet()
+	for _, f := range goFiles {
+		af, err := parser.ParseFile(fset, f, nil, parser.ImportsOnly)
+		if err != nil {
+			continue
+		}
+		for _, imp := range af.Imports {
+			path, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				continue
+			}
+			if path == facadePath {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // findModuleRoot walks up from start looking for a go.mod, returning
-// the directory containing it and the value of the `go` directive.
-func findModuleRoot(start string) (root, goVersion string, err error) {
+// the directory containing it, the value of the `go` directive, and the
+// module path from the `module` directive.
+func findModuleRoot(start string) (root, goVersion, modPath string, err error) {
 	dir := start
 	for {
 		gomod := filepath.Join(dir, "go.mod")
 		if data, rerr := os.ReadFile(gomod); rerr == nil {
 			v, perr := parseGoDirective(data)
 			if perr != nil {
-				return "", "", perr
+				return "", "", "", perr
 			}
-			return dir, v, nil
+			mp, perr := parseModulePath(data)
+			if perr != nil {
+				return "", "", "", perr
+			}
+			return dir, v, mp, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", "", fmt.Errorf("no go.mod found in %s or any parent", start)
+			return "", "", "", fmt.Errorf("no go.mod found in %s or any parent", start)
 		}
 		dir = parent
 	}
@@ -113,6 +240,28 @@ func parseGoDirective(data []byte) (string, error) {
 		return "", fmt.Errorf("go.mod missing or unparseable `go` directive")
 	}
 	return string(m[1]), nil
+}
+
+var modulePathRE = regexp.MustCompile(`(?m)^[ \t]*module[ \t]+(\S+)`)
+
+func parseModulePath(data []byte) (string, error) {
+	m := modulePathRE.FindSubmatch(data)
+	if m == nil {
+		return "", fmt.Errorf("go.mod missing or unparseable `module` directive")
+	}
+	return string(m[1]), nil
+}
+
+// facadeImportPath returns the import path of the umbrella package being
+// generated: the module path joined with the out file's directory
+// relative to the module root. For an out file at the module root this
+// is the module path itself.
+func facadeImportPath(modPath, modRoot, absOut string) string {
+	rel, err := filepath.Rel(modRoot, filepath.Dir(absOut))
+	if err != nil || rel == "." {
+		return modPath
+	}
+	return modPath + "/" + filepath.ToSlash(rel)
 }
 
 // validateOutPath ensures --out resolves inside modRoot. Returns the
@@ -294,7 +443,7 @@ func walkFile(file *ast.File, pkg *packages.Package) ([]TaggedDecl, []Diagnostic
 				Severity: SevWarning,
 				Pos:      pkg.Fset.Position(c.Pos()),
 				Rule:     RuleFloatingTag,
-				Message:  "microwave:export tag is not contiguous with a declaration; tag ignored",
+				Summary:  "tag not contiguous with a declaration; ignored",
 			})
 		}
 	}
@@ -309,7 +458,8 @@ func processFuncDecl(fd *ast.FuncDecl, pkg *packages.Package) (TaggedDecl, []Dia
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(fd.Doc.Pos()),
 			Rule:     RuleTagMalformed,
-			Message:  "malformed microwave:export tag (expected `//microwave:export` or `//microwave:export NewName`)",
+			Summary:  "malformed //microwave:export tag",
+			Fields:   []Field{F("expected", "//microwave:export or //microwave:export NewName")},
 		}}, false
 	}
 	if multi {
@@ -317,7 +467,8 @@ func processFuncDecl(fd *ast.FuncDecl, pkg *packages.Package) (TaggedDecl, []Dia
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(fd.Doc.Pos()),
 			Rule:     RuleMultiTag,
-			Message:  "more than one //microwave:export tag in a single doc comment group; one tag per declaration",
+			Summary:  "multiple //microwave:export tags in one comment group",
+			Fields:   []Field{F("hint", "each declaration may carry at most one tag")},
 		}}, false
 	}
 	if !found {
@@ -329,7 +480,11 @@ func processFuncDecl(fd *ast.FuncDecl, pkg *packages.Package) (TaggedDecl, []Dia
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(fd.Pos()),
 			Rule:     RuleMethodTag,
-			Message:  fmt.Sprintf("cannot tag method %s; tag its receiver type instead", fd.Name.Name),
+			Summary:  "methods cannot be tagged",
+			Fields: []Field{
+				F("method", fd.Name.Name),
+				F("fix", "tag the receiver type instead"),
+			},
 		}}, false
 	}
 
@@ -339,7 +494,7 @@ func processFuncDecl(fd *ast.FuncDecl, pkg *packages.Package) (TaggedDecl, []Dia
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(fd.Pos()),
 			Rule:     RuleBlankDecl,
-			Message:  "cannot tag a blank (`_`) declaration",
+			Summary:  "blank (_) declarations cannot be tagged",
 		}}, false
 	}
 
@@ -377,7 +532,8 @@ func processGenDecl(gd *ast.GenDecl, pkg *packages.Package) ([]TaggedDecl, []Dia
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(gd.Doc.Pos()),
 			Rule:     RuleTagMalformed,
-			Message:  "malformed microwave:export tag (expected `//microwave:export` or `//microwave:export NewName`)",
+			Summary:  "malformed //microwave:export tag",
+			Fields:   []Field{F("expected", "//microwave:export or //microwave:export NewName")},
 		})
 		gdFound = false
 	}
@@ -386,7 +542,8 @@ func processGenDecl(gd *ast.GenDecl, pkg *packages.Package) ([]TaggedDecl, []Dia
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(gd.Doc.Pos()),
 			Rule:     RuleMultiTag,
-			Message:  "more than one //microwave:export tag in a single doc comment group; one tag per declaration",
+			Summary:  "multiple //microwave:export tags in one comment group",
+			Fields:   []Field{F("hint", "each declaration may carry at most one tag")},
 		})
 		gdFound = false
 	}
@@ -396,7 +553,8 @@ func processGenDecl(gd *ast.GenDecl, pkg *packages.Package) ([]TaggedDecl, []Dia
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(gd.Doc.Pos()),
 			Rule:     RuleTagOnGroup,
-			Message:  "microwave:export tag sits above a multi-spec group; tag individual decls inside the group, not the group itself",
+			Summary:  "tag sits above a multi-spec group",
+			Fields:   []Field{F("fix", "tag individual specs inside the group instead")},
 		})
 		gdFound = false
 	}
@@ -428,7 +586,8 @@ func processTypeSpec(s *ast.TypeSpec, pkg *packages.Package, gdRename, gdDoc str
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(s.Doc.Pos()),
 			Rule:     RuleTagMalformed,
-			Message:  "malformed microwave:export tag",
+			Summary:  "malformed //microwave:export tag",
+			Fields:   []Field{F("expected", "//microwave:export or //microwave:export NewName")},
 		}}, false
 	}
 	if specMulti {
@@ -436,7 +595,8 @@ func processTypeSpec(s *ast.TypeSpec, pkg *packages.Package, gdRename, gdDoc str
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(s.Doc.Pos()),
 			Rule:     RuleMultiTag,
-			Message:  "more than one //microwave:export tag in a single doc comment group; one tag per declaration",
+			Summary:  "multiple //microwave:export tags in one comment group",
+			Fields:   []Field{F("hint", "each declaration may carry at most one tag")},
 		}}, false
 	}
 
@@ -456,7 +616,7 @@ func processTypeSpec(s *ast.TypeSpec, pkg *packages.Package, gdRename, gdDoc str
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(s.Pos()),
 			Rule:     RuleBlankDecl,
-			Message:  "cannot tag a blank (`_`) type",
+			Summary:  "blank (_) declarations cannot be tagged",
 		}}, false
 	}
 
@@ -485,7 +645,8 @@ func processValueSpec(s *ast.ValueSpec, gd *ast.GenDecl, pkg *packages.Package, 
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(s.Doc.Pos()),
 			Rule:     RuleTagMalformed,
-			Message:  "malformed microwave:export tag",
+			Summary:  "malformed //microwave:export tag",
+			Fields:   []Field{F("expected", "//microwave:export or //microwave:export NewName")},
 		}}, false
 	}
 	if specMulti {
@@ -493,7 +654,8 @@ func processValueSpec(s *ast.ValueSpec, gd *ast.GenDecl, pkg *packages.Package, 
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(s.Doc.Pos()),
 			Rule:     RuleMultiTag,
-			Message:  "more than one //microwave:export tag in a single doc comment group; one tag per declaration",
+			Summary:  "multiple //microwave:export tags in one comment group",
+			Fields:   []Field{F("hint", "each declaration may carry at most one tag")},
 		}}, false
 	}
 
@@ -512,7 +674,8 @@ func processValueSpec(s *ast.ValueSpec, gd *ast.GenDecl, pkg *packages.Package, 
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(s.Pos()),
 			Rule:     RuleMultiNameSpec,
-			Message:  "microwave:export cannot tag a spec that declares more than one name; split it into separate specs",
+			Summary:  "tagged spec declares more than one name",
+			Fields:   []Field{F("fix", "split into separate specs, one tag each")},
 		}}, false
 	}
 
@@ -522,7 +685,7 @@ func processValueSpec(s *ast.ValueSpec, gd *ast.GenDecl, pkg *packages.Package, 
 			Severity: SevError,
 			Pos:      pkg.Fset.Position(s.Pos()),
 			Rule:     RuleBlankDecl,
-			Message:  "cannot tag a blank (`_`) declaration",
+			Summary:  "blank (_) declarations cannot be tagged",
 		}}, false
 	}
 

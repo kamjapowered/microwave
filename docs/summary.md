@@ -11,16 +11,17 @@ The tool is **opt-in**: nothing is exported unless explicitly tagged.
 ## 2. Invocation
 
 ```
-microwave <path>... --out <file> --pkg <name>
+microwave <path>... --out <file> --pkg <name> [--exclude <path>...]
 ```
 
-All flags are **required**. No defaults, no inference.
+The positional paths and the `--out` / `--pkg` flags are **required**. `--exclude` is optional. No defaults, no inference.
 
-| Argument / Flag | Meaning                                                                                                                      |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `<path>...`     | One or more positional paths to scan (directories or globs, e.g. `./api/...`). No default — paths must be stated explicitly. |
-| `--out <file>`  | Path of the generated Go file.                                                                                               |
-| `--pkg <name>`  | Package name to declare at the top of the generated file.                                                                    |
+| Argument / Flag         | Meaning                                                                                                                                                                                  |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<path>...`             | One or more positional paths to scan (directories or Go recursive patterns, e.g. `./api/...`). No default — paths must be stated explicitly.                                             |
+| `--out <file>`          | Path of the generated Go file.                                                                                                                                                           |
+| `--pkg <name>`          | Package name to declare at the top of the generated file.                                                                                                                                |
+| `--exclude <path>`      | Repeatable. Package(s) to subtract from the resolved scan set. Accepts the same syntax as positional paths. Useful when a wider scan sweeps in packages that depend on the umbrella itself. |
 
 There are no subcommands in v0. No config file. No watch mode. No init scaffold.
 
@@ -135,7 +136,6 @@ All errors must be descriptive: name the offending file, line, and identifier, a
 | Condition                                                                 | Reason                                                                                                       |
 | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | Tagged type has **exported** struct fields whose types are unexported     | Surfaces leaked API but does not block. Unexported (lowercase) fields are ignored — they're already private. Includes embedded fields: an embedded field carries the embedded type's exported name as its field name, so an embedded unexported type counts as an exported field with an unexported type. |
-| Tagged var or const has an unexported declared type                       | Value is reachable, type name is not. Emitted with warning.                                                  |
 | Generic constraint on a tagged generic decl references an unexported type | Constraint cannot be satisfied from outside. Emitted with warning.                                           |
 | Floating `//microwave:export` tag not contiguous with any declaration     | The tag has lost its association with a decl (typically because of a blank line). The tag is ignored. Warning includes file/line so the user can fix it. |
 
@@ -144,6 +144,7 @@ Methods of a re-exported type are **not** re-checked. If the user tags a type, a
 ## 6. Scan Rules
 
 - Only the paths explicitly passed on the command line are scanned. No automatic walk of the whole module.
+- Any package whose import path matches a `--exclude` argument is removed from the scan set before type-checking begins. Excludes are resolved with the same loader pass as the positional paths, so `./pkg/consumer` and `./pkg/consumer/...` both work.
 - `_test.go` files are always skipped.
 - Packages whose import path contains `/internal/` are always skipped, even if explicitly passed.
 - The tool must be run from inside a Go module (a `go.mod` must be discoverable above the current working directory) so it can resolve package import paths.
@@ -160,15 +161,26 @@ The generated file is a normal Go source file:
 package umbrella
 
 import (
-    a "github.com/acme/foo/api/a"
-    b "github.com/acme/foo/api/b"
+    "github.com/acme/foo/api/a"
+    "github.com/acme/foo/api/b"
 )
+
+// =
+// a
+// =
+
+// Bar holds state.
+var Bar = a.Bar
 
 // Foo does the thing.
 type Foo = a.Foo
 
-// Bar holds state.
-var Bar = b.Bar
+// =
+// b
+// =
+
+// Baz is a constant.
+const Baz = b.Baz
 ```
 
 Rules:
@@ -176,8 +188,10 @@ Rules:
 - Header line is exactly `// Code generated by microwave. DO NOT EDIT.` (matches Go's recognised generated-file pattern).
 - The `//go:generate microwave ...` line records the exact invocation so `go generate ./...` reproduces the file.
 - No timestamp, no version line, no per-decl provenance comment — to keep diffs minimal.
-- Import aliases are deterministic and stable across runs.
-- Re-exports are grouped and ordered deterministically (e.g. by emitted name) so regeneration is diff-stable.
+- Imports are bare (`"path"`) when the package's declared name is unique among scanned packages. Only on a collision is an alias added (`pkgname2 "path"`), with the suffix assigned in sorted-path order.
+- Re-exports are grouped by source package. Each source-package section opens with a `// === pkg ===` banner whose rule width matches the package name.
+- Sections appear in alphabetical order of the chosen identifier (case-insensitive). Within each section, every tagged decl — type, var, const, func — is ordered alphabetically by emit name (case-insensitive), regardless of kind.
+- The ordering is fully deterministic, so regeneration is diff-stable.
 
 ### 7.1 Output location
 

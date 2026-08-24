@@ -177,7 +177,6 @@ For each `TaggedDecl`:
 | Func has unexported type in params or returns (incl. generic constraints) | `Kind == KindFunc` | error | `unexported-sig` |
 | Generic type tagged but module Go version < 1.24 | `Kind == KindType` and has type params | error | `generic-pre-124` |
 | Tagged type has exported struct field (incl. embedded) of unexported type | `Kind == KindType` and underlying is struct | warning | `unexported-field-type` |
-| Var/const declared type is unexported | `Kind == KindVar` or `KindConst` | warning | `unexported-value-type` |
 | Generic type constraint references unexported type | `Kind == KindType` with type params | warning | `unexported-constraint` |
 
 Field exportedness uses Go's standard rule: a field is exported iff its name starts uppercase. Embedded fields take their name from the embedded type's identifier. Validation walks `*types.Struct`; for every field whose `Exported()` is true, it inspects the field's type and emits `unexported-field-type` for each unexported named type referenced (via the shared `findUnexportedRefs` helper). The tagged type is still emitted — the warning surfaces leaked surface area without blocking.
@@ -199,23 +198,22 @@ Returns: `(lookupMap, []Diagnostic)`.
 
 Pure function: `emit(decls, lookup) ([]byte, error)`, then I/O writes the bytes.
 
-**Step 1: Group decls by emission section.**
+**Step 1: Group decls by source package.**
 
 Emit order in the output file (deterministic):
 1. Header + go:generate line + package decl
 2. Import block
-3. Types (sorted by emit name)
-4. Vars (sorted by emit name)
-5. Consts (sorted by emit name)
-6. Funcs (sorted by emit name)
+3. One section per source package, separated by `// === pkg ===` banners (rule width matches the package's chosen identifier).
 
-Grouping makes the file readable and makes diffs cluster predictably.
+Within each section, every tagged decl — type, var, const, func — is ordered alphabetically by emit name (case-insensitive). Sections themselves are ordered alphabetically by the chosen identifier (case-insensitive). Grouping by package mirrors the structure of a hand-written umbrella file and clusters related re-exports together.
 
-**Step 2: Assign import aliases.**
+**Step 2: Choose import identifiers.**
 
-Walk all `TaggedDecl`s; collect every source package path needed, plus every package referenced by a func wrapper's signature (after rewriting). The set is finite and known before emission.
+Walk all `TaggedDecl`s; collect every source package needed, plus every package referenced by a func wrapper's signature (after rewriting). For each, record the declared package name from `packages.Package.Name`.
 
-Alias scheme: take the last path segment, lowercase. If two packages share a segment, append a numeric suffix (`a`, `a2`, `a3`) in import-path-sorted order. Deterministic.
+Identifier scheme: prefer the package's declared name. If two source packages share a declared name, append a numeric suffix (`pkg`, `pkg2`, `pkg3`) in import-path-sorted order — deterministic.
+
+The import block emits `"path"` bare when the chosen identifier equals the declared name, and `alias "path"` when they differ (collision case).
 
 **Step 3: Per-kind emission.**
 
@@ -277,8 +275,8 @@ Write the formatted bytes to `--out`, creating parent dirs only if they already 
 
 Required because the file is checked into VCS and regenerated; spurious diffs are noise.
 
-- Emit order: sections fixed (types/vars/consts/funcs), within each section sort by emit name (Unicode codepoint order).
-- Import aliases: derived from sorted import paths, so adding/removing a package only renames the affected one.
+- Emit order: sections grouped by source package, sorted alphabetically (case-insensitive) by the chosen identifier; within each section every decl is sorted alphabetically (case-insensitive) by emit name regardless of kind. Ties broken by the original identifier (Unicode codepoint order).
+- Import identifiers: derived from the declared package name; on collision suffixes are assigned in sorted-path order, so adding/removing a package only renames the affected one.
 - Doc comments: copied verbatim, no reflow.
 - No timestamp, no version, no per-decl provenance.
 
@@ -303,7 +301,7 @@ None in v0. `packages.Load` is already parallel internally. Sequential per-phase
 
 2. **Wrapper for a func with variadic + unexported type.** Edge case: `func F(args ...internal.T)`. The wrapper would be `func F(args ...internal.T)` — fails the `unexported-sig` rule, so it errors out before emission. No special handling needed. Verify.
 
-3. **Generic func wrappers and constraint type inference.** When emitting `func F[T any](x T) T { return aliasN.F[T](x) }`, we explicitly pass the type parameter to the source call. Go can usually infer it, but explicit is safer and free.
+3. **Generic func wrappers and constraint type inference.** The wrapper body omits explicit type arguments when every declared type parameter appears in some parameter type (so Go can infer them at the call site): `func F[T any](x T) T { return pkg.F(x) }`. When at least one type parameter only shows up in the result type — or in no parameter at all — the wrapper falls back to the explicit form `pkg.F[T1, T2, ...](args...)`, since inference would otherwise fail.
 
 4. **Self-referential generic constraints.** `func F[T Ordered[T]](...)` — the constraint references the type param being defined. Rewriting must not lose the back-reference. Test fixture required.
 

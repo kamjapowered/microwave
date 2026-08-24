@@ -1,6 +1,6 @@
 package main
 
-import "microwave/cmd"
+import "kamjapowered.com/microwave/cmd"
 
 func main() {
 	cmd.Execute()

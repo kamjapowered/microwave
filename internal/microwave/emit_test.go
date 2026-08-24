@@ -2,30 +2,53 @@ package microwave
 
 import "testing"
 
-func TestAssignAliases_Deterministic(t *testing.T) {
-	in := map[string]bool{
-		"github.com/acme/foo/api/a":  true,
-		"github.com/acme/foo/api/b":  true,
-		"github.com/acme/bar/api/a":  true, // collides on last segment "a"
-		"example.com/some/internal": true,  // collides on "internal" with hypothetical other
+func TestAssignAliases_NoCollision_UsesNaturalName(t *testing.T) {
+	in := map[string]string{
+		"github.com/acme/foo/api/a":  "a",
+		"github.com/acme/foo/api/b":  "b",
+		"github.com/example/widgets": "widgets",
+	}
+	out := assignAliases(in)
+	for path, want := range map[string]string{
+		"github.com/acme/foo/api/a":  "a",
+		"github.com/acme/foo/api/b":  "b",
+		"github.com/example/widgets": "widgets",
+	} {
+		if got := out[path]; got != want {
+			t.Errorf("path %q: chosen = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestAssignAliases_Collision_SuffixesInSortedOrder(t *testing.T) {
+	in := map[string]string{
+		"github.com/acme/foo/api/a": "a",
+		"github.com/acme/bar/api/a": "a", // collides on declared name
 	}
 	out := assignAliases(in)
 	if got := out["github.com/acme/bar/api/a"]; got != "a" {
-		t.Errorf("expected first sorted 'a' path to win alias 'a'; got %q for bar", got)
+		t.Errorf("first-sorted path got %q, want \"a\"", got)
 	}
 	if got := out["github.com/acme/foo/api/a"]; got != "a2" {
-		t.Errorf("expected second 'a' path to get 'a2'; got %q for foo", got)
-	}
-	if got := out["github.com/acme/foo/api/b"]; got != "b" {
-		t.Errorf("expected 'b' alias; got %q", got)
+		t.Errorf("second-sorted path got %q, want \"a2\"", got)
 	}
 
-	// Determinism: running again gives same map.
+	// Determinism: a second call yields the same map.
 	out2 := assignAliases(in)
 	for k, v := range out {
 		if out2[k] != v {
 			t.Errorf("non-deterministic: %s = %q vs %q", k, v, out2[k])
 		}
+	}
+}
+
+func TestAssignAliases_MissingNaturalName_FallsBackToLastSegment(t *testing.T) {
+	in := map[string]string{
+		"github.com/acme/foo/api/a": "", // missing declared name
+	}
+	out := assignAliases(in)
+	if got := out["github.com/acme/foo/api/a"]; got != "a" {
+		t.Errorf("got %q, want \"a\"", got)
 	}
 }
 

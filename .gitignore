@@ -27,3 +27,6 @@ Thumbs.db
 *.tar
 *.tar.gz
 *.tgz
+
+# go build cache used by the justfile recipes
+.cache/
